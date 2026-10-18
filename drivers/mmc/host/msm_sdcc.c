@@ -4095,10 +4095,15 @@ msmsdcc_runtime_suspend(struct device *dev)
 		pm_runtime_get_noresume(dev);
 #ifdef CONFIG_HUAWEI_WIFI_SDCC
              if (host->pdev_id == SDCC_WIFI_SLOT){
-                    /*if it is the QUALCOMM wifi chip , we need not to close the clock */
-                    if (WIFI_QUALCOMM == get_hw_wifi_device_type()){
-                        rc = mmc_suspend_host(mmc);
-                    }else  if(host->clks_on) {    /*if it is the wifi slot , we need to close the clock in order to save power*/
+                    /*
+                     * Y210 (Atheros AR6005, "QUALCOMM" en hardware_self_adapt):
+                     * igual que con Broadcom, solo se apagan los relojes y no
+                     * se llama a mmc_suspend_host(). ar6000.ko no pide
+                     * MMC_PM_KEEP_POWER, asi que con mmc_suspend_host() el
+                     * core reinicializaba la tarjeta al despertar (CMD5 -110)
+                     * y el chip quedaba inutilizable, en WoW o en deep sleep.
+                     */
+                    if (host->clks_on) {    /*if it is the wifi slot , we need to close the clock in order to save power*/
                         clk_disable(host->clk);    
                         clk_disable(host->pclk);    
                         host->clks_on = 0;   
@@ -4192,11 +4197,8 @@ msmsdcc_runtime_resume(struct device *dev)
 
 #ifdef CONFIG_HUAWEI_WIFI_SDCC
                 if (host->pdev_id == SDCC_WIFI_SLOT){
-                    /*if it is the QUALCOMM wifi chip , we need not to open the clock closed when suspend*/ 
-                    if (WIFI_QUALCOMM == get_hw_wifi_device_type()){
-                       mmc_resume_host(mmc);
-                    }
-                    else if(!host->clks_on) {           /*if it is the wifi slot , we need to open the clock closed when suspend*/                     
+                    /* ver msmsdcc_runtime_suspend: solo relojes para el slot Wi-Fi */
+                    if (!host->clks_on) {           /*if it is the wifi slot , we need to open the clock closed when suspend*/                     
                        clk_enable(host->pclk);                                
                        clk_enable(host->clk);                                
                        host->clks_on = 1;                        
