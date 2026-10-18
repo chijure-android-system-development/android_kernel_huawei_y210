@@ -210,8 +210,17 @@ qup_i2c_interrupt(int irq, void *devid)
 	}
 
 	if (status & I2C_STATUS_ERROR_MASK) {
-		dev_err(dev->dev, "QUP: I2C status flags :0x%x, irq:%d\n",
-			status, irq);
+		/*
+		 * NACK = nadie respondio en esa direccion: lo normal cuando el
+		 * kernel generico de Huawei prueba chips de otros modelos. El
+		 * driver que hizo el probe ya informa su propio fallo.
+		 */
+		if (status & QUP_I2C_NACK_FLAG)
+			dev_dbg(dev->dev, "QUP: I2C status flags :0x%x, irq:%d\n",
+				status, irq);
+		else
+			dev_err(dev->dev, "QUP: I2C status flags :0x%x, irq:%d\n",
+				status, irq);
 		err = status;
 		/* Clear Error interrupt if it's a level triggered interrupt*/
 		if (dev->num_irqs == 1) {
@@ -992,7 +1001,7 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 				if (dev->err) {
 					if (dev->err > 0 &&
 						dev->err & QUP_I2C_NACK_FLAG) {
-						dev_err(dev->dev,
+						dev_dbg(dev->dev,
 						"I2C slave addr:0x%x not connected\n",
 						dev->msg->addr);
 						dev->err = ENOTCONN;
@@ -1287,7 +1296,7 @@ qup_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 			if (dev->err) {
 				if (dev->err > 0 &&
 					dev->err & QUP_I2C_NACK_FLAG)
-					dev_err(dev->dev,
+					dev_dbg(dev->dev,
 					"I2C slave addr:0x%x not connected\n",
 					dev->msg->addr);
 				else if (dev->err < 0) {
