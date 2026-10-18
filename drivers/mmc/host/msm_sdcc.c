@@ -4097,6 +4097,16 @@ msmsdcc_runtime_suspend(struct device *dev)
              if (host->pdev_id == SDCC_WIFI_SLOT){
                     /*if it is the QUALCOMM wifi chip , we need not to close the clock */
                     if (WIFI_QUALCOMM == get_hw_wifi_device_type()){
+                        /*
+                         * ar6000.ko (Atheros, binario) arma WoW y deja el
+                         * chip alimentado por la placa, pero nunca pide
+                         * MMC_PM_KEEP_POWER. Sin el flag el core cree que la
+                         * tarjeta se apago, la reinicializa al despertar
+                         * (CMD5 -110) y el resume del driver nunca corre:
+                         * el Wi-Fi queda sin datos hasta un off/on.
+                         */
+                        if (mmc->card && mmc->card->type == MMC_TYPE_SDIO)
+                            mmc->pm_flags |= MMC_PM_KEEP_POWER;
                         rc = mmc_suspend_host(mmc);
                     }else  if(host->clks_on) {    /*if it is the wifi slot , we need to close the clock in order to save power*/
                         clk_disable(host->clk);    
