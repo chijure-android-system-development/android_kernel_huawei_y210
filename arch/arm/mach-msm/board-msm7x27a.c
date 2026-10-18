@@ -83,7 +83,11 @@ static ssize_t  buf_vkey_size=0;
 #define S5K5CA_AND_MT9T113_IS_NOT_ON 0 
 #define S5K5CA_OR_MT9T113_IS_ON 1
 /*we use the variable to sign if s5k5ca or mt9t113 is on*/
+#if defined(CONFIG_HUAWEI_CAMERA_SENSOR_S5K5CA) || \
+	defined(CONFIG_HUAWEI_CAMERA_SENSOR_MT9T113) || \
+	defined(CONFIG_HUAWEI_CAMERA_SENSOR_HI255)
 static int s5k5ca_or_mt9t113_is_on = S5K5CA_AND_MT9T113_IS_NOT_ON;
+#endif
 #endif
 char  back_camera_name[128];
 char  front_camera_name[128];
@@ -4179,14 +4183,22 @@ static int config_gpio_table(uint32_t *table, int len)
 	return rc;
 }
 
+#ifdef CONFIG_HUAWEI_SENSOR_S5K4E1
 static struct msm_camera_sensor_info msm_camera_sensor_s5k4e1_data;
+#endif
+#ifdef CONFIG_WEBCAM_OV9726
 static struct msm_camera_sensor_info msm_camera_sensor_ov9726_data;
+#endif
 #ifdef CONFIG_HUAWEI_CAMERA
 /*we transfer the func after s5k5ca is probe succeed*/
+#if defined(CONFIG_HUAWEI_CAMERA_SENSOR_S5K5CA) || \
+	defined(CONFIG_HUAWEI_CAMERA_SENSOR_MT9T113) || \
+	defined(CONFIG_HUAWEI_CAMERA_SENSOR_HI255)
 static void camera_s5k5ca_or_mt9t113_is_on(int s5k5ca_or_mt9t113_probe_success)
 {
 	s5k5ca_or_mt9t113_is_on = s5k5ca_or_mt9t113_probe_success ;
 }
+#endif
 static int config_camera_on_gpios_rear(void)
 {
 	int rc = 0;
@@ -6435,14 +6447,28 @@ static void camera_sensor_pwd_config(void)
 		pr_err("camera sensor pwd gpio is %d\n",gpio_pwd);
 		
 		/*config the camera pwd gpio*/
+		/* cada struct existe solo si su sensor esta en el defconfig */
+#ifdef CONFIG_HUAWEI_SENSOR_MT9E013
 		msm_camera_sensor_mt9e013_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_SENSOR_MT9P017
 		msm_camera_sensor_mt9p017_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_SENSOR_S5K4E1
 		msm_camera_sensor_s5k4e1_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_CAMERA_SENSOR_S5K5CA
 		msm_camera_sensor_s5k5ca_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_CAMERA_SENSOR_MT9T113
 		msm_camera_sensor_mt9t113_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_CAMERA_SENSOR_MT9D113
 		msm_camera_sensor_mt9d113_data.sensor_pwd = gpio_pwd;
+#endif
+#ifdef CONFIG_HUAWEI_CAMERA_SENSOR_HI255
 		msm_camera_sensor_hi255_data.sensor_pwd = gpio_pwd;
-		msm_camera_sensor_hi255_data.sensor_pwd = gpio_pwd;
+#endif
 	}
 }
 #endif
