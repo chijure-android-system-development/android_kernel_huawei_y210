@@ -108,6 +108,16 @@ struct tavarua_device {
 	/* work queue */
 	struct workqueue_struct *wqueue;
 	struct delayed_work work;
+	/* seek down emulation, see sd_handle_irq() */
+	int sd_state;
+	int sd_target;
+	int sd_best;
+	int sd_window;
+	char sd_rmssi;
+	int sd_aborting;
+	int sd_from;
+	int sd_empty;	/* channels just below the target known to be empty */
+	struct delayed_work sd_poll;
 	/* wait queue for blocking event read */
 	wait_queue_head_t event_queue;
 	/* wait queue for raw rds read */
@@ -148,6 +158,12 @@ static int tavarua_request_irq(struct tavarua_device *radio);
 static void start_pending_xfr(struct tavarua_device *radio);
 /* work function */
 static void read_int_stat(struct work_struct *work);
+/* seek down emulation, see sd_handle_irq() */
+enum { SD_IDLE, SD_TUNING, SD_SEARCHING, SD_FINISHING };
+#define SD_FIRST	5	/* first window, channels of 100 kHz */
+#define SD_SPACING	1600	/* 100 kHz in 62.5 Hz units */
+static int sd_handle_irq(struct tavarua_device *radio);
+static int tavarua_search(struct tavarua_device *radio, int on, int dir);
 
 static int is_bahama(void)
 {
@@ -740,6 +756,17 @@ static void tavarua_handle_interrupts(struct tavarua_device *radio)
 	FMDBG("INTSTAT2 <%x>\n", radio->registers[STATUS_REG2]);
 	FMDBG("INTSTAT3 <%x>\n", radio->registers[STATUS_REG3]);
 
+	if (radio->sd_state != SD_IDLE) {
+		int was_finishing = radio->sd_state == SD_FINISHING;
+
+		if (sd_handle_irq(radio))
+			radio->registers[STATUS_REG1] &=
+				~(TUNE | SEARCH | SCANNEXT | SIGNAL);
+		else if (was_finishing)
+			/* report the end of the emulated seek */
+			radio->registers[STATUS_REG1] |= SEARCH;
+	}
+
 	if (radio->registers[STATUS_REG1] & READY) {
 		complete(&radio->sync_req_done);
 		tavarua_q_event(radio, TAVARUA_EVT_RADIO_READY);
@@ -1066,6 +1093,167 @@ FUNCTION:  read_int_stat
 
   @return None.
 */
+/*
+ * Seek down emulation.
+ *
+ * On this chip (Y210 WCN2243 with the stock fm_qsoc_patches) a downward
+ * hardware seek sweeps the band without ever stopping on a station, while an
+ * upward seek works. Huawei's own FM HAL sends the same command, so this is
+ * firmware behaviour. Emulate it with upward seeks: tune to a window below
+ * the current channel, seek up repeatedly and keep the last station found
+ * below it. The window starts at SD_FIRST channels and doubles while it holds
+ * no station; each sweep is cut where the part already found empty begins.
+ * The chip sweeps ~70 ms per channel, so a small first window keeps the usual
+ * case short. The intermediate tune/seek interrupts are hidden from
+ * userspace, which only sees the final TUNE and SEEK_COMPLETE, as for a
+ * hardware seek.
+ */
+
+static int sd_nchan(struct tavarua_device *radio)
+{
+	return (radio->region_params.band_high -
+		radio->region_params.band_low) / SD_SPACING + 1;
+}
+
+static int sd_tune(struct tavarua_device *radio, int chan)
+{
+	unsigned char cmd[2] = { chan, TUNE_STATION };
+
+	return tavarua_write_registers(radio, FREQ, cmd, 2);
+}
+
+static int sd_start_window(struct tavarua_device *radio)
+{
+	int n = sd_nchan(radio);
+
+	if (radio->sd_window >= n) {
+		/* no station anywhere: go back where we were */
+		radio->sd_state = SD_FINISHING;
+		return sd_tune(radio, radio->sd_target);
+	}
+	radio->sd_state = SD_TUNING;
+	return sd_tune(radio, (radio->sd_target - radio->sd_window + n) % n);
+}
+
+#define SD_POLL_MS	30
+
+/* Stop the running upward seek without leaving the emulation. */
+static int sd_abort_search(struct tavarua_device *radio)
+{
+	radio->registers[SRCHCTRL] &= ~SRCH_ON;
+	return tavarua_write_registers(radio, SRCHRDS1,
+				&radio->registers[SRCHRDS1], 3);
+}
+
+static void sd_seek_up(struct tavarua_device *radio)
+{
+	radio->sd_aborting = 0;
+	radio->sd_from = radio->registers[FREQ];
+	tavarua_search(radio, CTRL_ON, SRCH_DIR_UP);
+	schedule_delayed_work(&radio->sd_poll, msecs_to_jiffies(SD_POLL_MS));
+}
+
+/* An upward seek from the window start stops at the first station above it,
+ * which can be far above the target. Watch FREQ (reading it does not disturb
+ * the seek) and cut the seek once it reaches the part below the target known
+ * to be empty (or the target itself); the chip then returns to where the seek
+ * started and the SEARCH interrupt is handled as "no station here". */
+static void sd_poll_fn(struct work_struct *work)
+{
+	struct tavarua_device *radio = container_of(work,
+		struct tavarua_device, sd_poll.work);
+	int n, dist;
+
+	mutex_lock(&radio->lock);
+	if (radio->sd_state == SD_SEARCHING && !radio->sd_aborting &&
+	    tavarua_read_registers(radio, FREQ, 1) >= 0) {
+		n = sd_nchan(radio);
+		dist = (radio->sd_target - radio->registers[FREQ] + n) % n;
+		if (dist <= radio->sd_empty || dist > radio->sd_window) {
+			radio->sd_aborting = 1;
+			sd_abort_search(radio);
+		} else {
+			schedule_delayed_work(&radio->sd_poll,
+				msecs_to_jiffies(SD_POLL_MS));
+		}
+	}
+	mutex_unlock(&radio->lock);
+}
+
+/* Called with radio->lock held. Returns 1 if the interrupt belongs to the
+ * emulation and must not be reported. */
+static int sd_handle_irq(struct tavarua_device *radio)
+{
+	unsigned char st = radio->registers[STATUS_REG1];
+	int n, chan, dist;
+
+	switch (radio->sd_state) {
+	case SD_TUNING:
+		if (!(st & TUNE))
+			return 1;
+		radio->sd_state = SD_SEARCHING;
+		sd_seek_up(radio);
+		return 1;
+	case SD_SEARCHING:
+		if (!(st & SEARCH))
+			return 1;
+		if (tavarua_read_registers(radio, FREQ, 1) < 0) {
+			radio->sd_state = SD_FINISHING;
+			sd_tune(radio, radio->sd_target);
+			return 1;
+		}
+		chan = radio->registers[FREQ];
+		n = sd_nchan(radio);
+		dist = (radio->sd_target - chan + n) % n;
+		FMDBG("seek down: %02x target %02x window %d best %d\n", chan,
+			radio->sd_target, radio->sd_window, radio->sd_best);
+		/* A cancelled seek returns to where it started, and so does one
+		 * that found nothing: neither is a station below the target. */
+		if (radio->sd_aborting || chan == radio->sd_from ||
+		    dist <= radio->sd_empty)
+			dist = 0;
+		if (dist > 0 && dist < radio->sd_window) {
+			/* a station below the target: look for a closer one */
+			radio->sd_best = chan;
+			sd_seek_up(radio);
+		} else if (radio->sd_best >= 0) {
+			radio->sd_state = SD_FINISHING;
+			sd_tune(radio, radio->sd_best);
+		} else {
+			/* only the new part of the next window needs a sweep */
+			radio->sd_empty = radio->sd_window;
+			radio->sd_window *= 2;
+			sd_start_window(radio);
+		}
+		return 1;
+	case SD_FINISHING:
+		if (!(st & TUNE))
+			return 1;
+		radio->sd_state = SD_IDLE;
+		return 0;
+	}
+	return 0;
+}
+
+static int sd_start(struct tavarua_device *radio)
+{
+	int retval;
+
+	mutex_lock(&radio->lock);
+	retval = tavarua_read_registers(radio, FREQ, 1);
+	if (retval >= 0) {
+		radio->sd_target = radio->registers[FREQ];
+		radio->sd_best = -1;
+		radio->sd_window = SD_FIRST;
+		radio->sd_empty = 0;
+		retval = sd_start_window(radio);
+		if (retval < 0)
+			radio->sd_state = SD_IDLE;
+	}
+	mutex_unlock(&radio->lock);
+	return retval;
+}
+
 static void read_int_stat(struct work_struct *work)
 {
 	struct tavarua_device *radio = container_of(work,
@@ -1348,6 +1536,8 @@ static int tavarua_search(struct tavarua_device *radio, int on, int dir)
 	enum search_t srch = radio->registers[SRCHCTRL] & SRCH_MODE;
 
 	FMDBG("In tavarua_search\n");
+	if (!on)
+		radio->sd_state = SD_IDLE;
 	if (on) {
 		radio->registers[SRCHRDS1] = 0x00;
 		radio->registers[SRCHRDS2] = 0x00;
@@ -1688,6 +1878,7 @@ static int tavarua_set_freq(struct tavarua_device *radio, unsigned int freq)
 	unsigned char cmd[] = {0x00, 0x00};
 	unsigned int spacing;
 	int retval;
+	radio->sd_state = SD_IDLE;
 	band_bottom = radio->region_params.band_low;
 	spacing  = 0.100 * FREQ_MUL;
 	if ((freq % 1600) == 800) {
@@ -3341,6 +3532,20 @@ static int tavarua_vidioc_g_tuner(struct file *file, void *priv,
 
 	if (tuner->index > 0)
 		return -EINVAL;
+	if (radio->sd_state != SD_IDLE) {
+		/* an RMSSI peek drops the emulated seek's tune commands:
+		 * report the last value instead */
+		tuner->signal = radio->sd_rmssi;
+		strcpy(tuner->name, "FM");
+		tuner->type = V4L2_TUNER_RADIO;
+		tuner->rangelow  =  radio->region_params.band_low;
+		tuner->rangehigh =  radio->region_params.band_high;
+		tuner->rxsubchans = V4L2_TUNER_SUB_MONO | V4L2_TUNER_SUB_STEREO;
+		tuner->capability = V4L2_TUNER_CAP_LOW;
+		tuner->audmode = V4L2_TUNER_MODE_STEREO;
+		tuner->afc = 0;
+		return 0;
+	}
 
 	/* read status rssi */
 	retval = tavarua_read_registers(radio, IOCTRL, 1);
@@ -3355,6 +3560,7 @@ static int tavarua_vidioc_g_tuner(struct file *file, void *priv,
 	msleep(TAVARUA_DELAY*10);
 	retval = tavarua_read_registers(radio, XFRDAT0, 3);
 	rmssi = radio->registers[XFRDAT0];
+	radio->sd_rmssi = rmssi;
 	tuner->signal = rmssi;
 
 	strcpy(tuner->name, "FM");
@@ -3453,6 +3659,12 @@ static int tavarua_vidioc_g_frequency(struct file *file, void *priv,
 {
 	struct tavarua_device *radio = video_get_drvdata(video_devdata(file));
 	freq->type = V4L2_TUNER_RADIO;
+	if (radio->sd_state != SD_IDLE) {
+		/* keep reporting the start: the intermediate tunes are internal */
+		freq->frequency = radio->sd_target * SD_SPACING +
+			radio->region_params.band_low;
+		return 0;
+	}
 	return tavarua_get_freq(radio, freq);
 
 }
@@ -3638,6 +3850,11 @@ static int tavarua_vidioc_s_hw_freq_seek(struct file *file, void *priv,
 	else
 		dir = SRCH_DIR_DOWN;
 	FMDBG("starting search\n");
+	if (radio->sd_state != SD_IDLE)
+		return 0;	/* an emulated seek down is still running */
+	if (dir == SRCH_DIR_DOWN &&
+	    (radio->registers[SRCHCTRL] & SRCH_MODE) == SEEK)
+		return sd_start(radio);
 	return tavarua_search(radio, CTRL_ON, dir);
 }
 
@@ -4046,6 +4263,7 @@ static int  __init tavarua_probe(struct platform_device *pdev)
     /*Start the worker thread for event handling and register read_int_stat
 	as worker function*/
 	INIT_DELAYED_WORK(&radio->work, read_int_stat);
+	INIT_DELAYED_WORK(&radio->sd_poll, sd_poll_fn);
 
 	/* register video device */
 	if (video_register_device(radio->videodev, VFL_TYPE_RADIO, radio_nr)) {
